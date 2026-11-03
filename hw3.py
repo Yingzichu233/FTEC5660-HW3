@@ -55,9 +55,220 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+# ---------------------------------------------------------------------------
+# Student implementation: a Fisher agent for points 1, 2 and 5.
+#
+# Design (the README report describes it in full):
+#   * routing: every chosen point is routed to the source that can answer it.
+#     Points 1, 2 and 5 are all database points, so evidence comes from the
+#     sql_query tool only; no interviews are spent.
+#   * tool use: every sum, ratio and comparison is computed in SQL or Python,
+#     never by the model.
+#   * prompt chaining: the model turns the computed evidence into a written
+#     summary, and a second model call reflects on the draft and fixes it if
+#     a verdict or number is misstated. Verdicts themselves never come from
+#     the model.
+#   * parallelism and isolation: companies are analysed concurrently and one
+#     company's failure cannot affect the others.
+# ---------------------------------------------------------------------------
+
+# PASS rules, written down so the prompt, the code and the README cannot drift.
+POINT_RULES = {
+    1: "PASS when the company's revenue growth over the last two full fiscal "
+       "years is at least the industry median 2-year revenue growth "
+       "(industry_medians.revenue_growth_2y_pct); FAIL when it is below.",
+    2: "PASS when products launched since the start of the order history "
+       "(about the last three years) make up a share of revenue since the "
+       "start of the last full fiscal year that is at least the industry "
+       "median new-product share (industry_medians.new_product_share_pct); "
+       "FAIL when it is below.",
+    5: "PASS when the operating margin of the last full fiscal year, "
+       "(revenue - cost of sales - selling and admin - R&D) / revenue, is at "
+       "least the industry median operating margin "
+       "(industry_medians.operating_margin_pct); FAIL when it is below.",
+}
+
+MAX_PARALLEL_COMPANIES = 5
+
+SUMMARY_PROMPT = """\
+You are an investment analyst applying Philip Fisher's "fifteen points to look \
+for in a common stock" (Common Stocks and Uncommon Profits). The evidence \
+below was gathered from the company's database and the verdicts were computed \
+from it with fixed rules; they are final and must not be changed.
+
+{evidence}
+
+Write a short analyst summary (2 or 3 sentences) that explains the verdicts \
+in plain English, quoting the key figures. Do not output JSON, do not repeat \
+the questions, and do not contradict the verdicts."""
+
+REFLECTION_PROMPT = """\
+Below is the evidence for a Fisher analysis of a company and a draft summary \
+of it.
+
+{evidence}
+
+Draft summary:
+\"\"\"{draft}\"\"\"
+
+Check the draft against the evidence: every PASS/FAIL verdict and every \
+figure must match. If anything is misstated, rewrite the summary correctly; \
+otherwise return the draft unchanged. Return only the summary text (2 or 3 \
+sentences, no JSON, no commentary)."""
+
+
+def _rows(text: str) -> list[dict[str, str]]:
+    """Parse the pipe-separated output of the sql_query tool into dicts."""
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return []
+    header = [cell.strip() for cell in lines[0].split("|")]
+    rows = []
+    for line in lines[1:]:
+        if line.startswith("...") or line.startswith("(no rows"):
+            continue
+        rows.append(dict(zip(header, (cell.strip() for cell in line.split("|")))))
+    return rows
+
+
+def _num(value: Any) -> float:
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _message_text(message: Any) -> str:
+    """Return the text of a LangChain message (content may be str or blocks)."""
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
+        return "".join(parts).strip()
+    return str(content).strip()
+
+
+def _gather_metrics(tools: list[Any]) -> dict[str, Any]:
+    """Collect every figure the rules need, through the sql_query tool only."""
+    sql = next(tool for tool in tools if tool.name == "sql_query")
+
+    def query(statement: str) -> list[dict[str, str]]:
+        return _rows(sql.invoke({"query": statement}))
+
+    medians = query(
+        "SELECT c.industry AS industry, "
+        "m.revenue_growth_2y_pct AS med_growth, "
+        "m.new_product_share_pct AS med_new_share, "
+        "m.operating_margin_pct AS med_margin "
+        "FROM company c JOIN industry_medians m ON m.industry = c.industry"
+    )[0]
+    span = query("SELECT MIN(order_date) AS dmin, MAX(order_date) AS dmax FROM orders")[0]
+    revenue = {
+        row["yr"]: _num(row["rev"])
+        for row in query(
+            "SELECT substr(order_date, 1, 4) AS yr, SUM(amount) AS rev "
+            "FROM orders GROUP BY yr"
+        )
+    }
+
+    first_year = int(str(span["dmin"])[:4])
+    # The last full fiscal year: the latest order year if it reaches December,
+    # otherwise the year before it.
+    last_full_year = int(str(span["dmax"])[:4]) - (0 if str(span["dmax"])[5:7] == "12" else 1)
+    window = max(last_full_year - first_year, 1)
+
+    # Point 1: revenue growth over the window, normalised to a 2-year figure
+    # so it stays comparable to industry_medians.revenue_growth_2y_pct.
+    rev_first, rev_last = revenue[str(first_year)], revenue[str(last_full_year)]
+    growth = (rev_last / rev_first - 1) * 100
+    if window != 2:
+        growth = ((1 + growth / 100) ** (2.0 / window) - 1) * 100
+
+    # Point 2: revenue share of products launched since first_year, measured
+    # on all revenue from the start of the last full fiscal year onward.
+    share_row = query(
+        "SELECT 100.0 * SUM(CASE WHEN p.launch_date >= "
+        f"'{first_year}-01-01' THEN o.amount ELSE 0 END) / SUM(o.amount) AS share "
+        "FROM orders o JOIN products p ON p.product = o.product "
+        f"WHERE o.order_date >= '{last_full_year}-01-01'"
+    )[0]
+
+    # Point 5: operating margin of the last full fiscal year.
+    costs = query(
+        "SELECT SUM(cost_of_sales) AS cos, SUM(selling_admin) AS sa, "
+        "SUM(research_development) AS rd FROM monthly_costs "
+        f"WHERE month >= '{last_full_year}-01' AND month <= '{last_full_year}-12'"
+    )[0]
+    margin = (rev_last - _num(costs["cos"]) - _num(costs["sa"]) - _num(costs["rd"])) / rev_last * 100
+
+    return {
+        "industry": medians["industry"],
+        "first_year": first_year,
+        "last_full_year": last_full_year,
+        "growth_2y_pct": growth,
+        "med_growth_2y_pct": _num(medians["med_growth"]),
+        "new_product_share_pct": _num(share_row["share"]),
+        "med_new_product_share_pct": _num(medians["med_new_share"]),
+        "operating_margin_pct": margin,
+        "med_operating_margin_pct": _num(medians["med_margin"]),
+        "revenue_last_musd": rev_last / 1000,
+    }
+
+
+def _apply_rules(metrics: dict[str, Any]) -> dict[int, str]:
+    """The PASS/FAIL rules for CHOSEN_POINTS, computed in Python only."""
+    return {
+        1: "PASS" if metrics["growth_2y_pct"] >= metrics["med_growth_2y_pct"] else "FAIL",
+        2: "PASS" if metrics["new_product_share_pct"] >= metrics["med_new_product_share_pct"] else "FAIL",
+        5: "PASS" if metrics["operating_margin_pct"] >= metrics["med_operating_margin_pct"] else "FAIL",
+    }
+
+
+def _evidence_text(name: str, metrics: dict[str, Any], verdicts: dict[int, str]) -> str:
+    """Render the computed metrics as evidence for the prompt and fallback."""
+    return (
+        f"Company: {name.replace('_', ' ').title()} (industry: {metrics['industry']}).\n"
+        f"Point 1 (market potential for sales growth): revenue grew "
+        f"{metrics['growth_2y_pct']:.1f}% over the two full fiscal years "
+        f"{metrics['first_year']}-{metrics['last_full_year']}; the industry median "
+        f"2-year growth is {metrics['med_growth_2y_pct']:.1f}%. Verdict: {verdicts[1]}.\n"
+        f"Point 2 (new products as current lines mature): products launched since "
+        f"{metrics['first_year']} account for {metrics['new_product_share_pct']:.1f}% "
+        f"of revenue since the start of {metrics['last_full_year']}; the industry "
+        f"median new-product share is {metrics['med_new_product_share_pct']:.1f}%. "
+        f"Verdict: {verdicts[2]}.\n"
+        f"Point 5 (worthwhile profit margin): the operating margin of "
+        f"{metrics['last_full_year']} is {metrics['operating_margin_pct']:.1f}% "
+        f"(revenue US${metrics['revenue_last_musd']:.0f}m); the industry median is "
+        f"{metrics['med_operating_margin_pct']:.1f}%. Verdict: {verdicts[5]}."
+    )
+
+
+def _analyze_company(model: Any, name: str, tools: list[Any]) -> dict[str, Any]:
+    """Full pipeline for one company: gather, apply rules, summarise."""
+    metrics = _gather_metrics(tools)
+    verdicts = _apply_rules(metrics)
+    evidence = _evidence_text(name, metrics, verdicts)
+
+    draft = None
+    try:
+        draft = _message_text(model.invoke(SUMMARY_PROMPT.format(evidence=evidence)))
+        summary = _message_text(
+            model.invoke(REFLECTION_PROMPT.format(evidence=evidence, draft=draft))
+        )
+    except Exception:
+        summary = None
+    if not summary:
+        # No API call needed for the verdicts: fall back to the bare evidence.
+        summary = draft or evidence
+
+    return {"points": verdicts, "summary": summary}
+
+
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 2, 5]
 
 
 def build_agent() -> Any:
@@ -71,8 +282,9 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0, max_retries=2)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +320,16 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_COMPANIES)
+
+    async def run_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                return name, await asyncio.to_thread(_analyze_company, agent, name, tools)
+            except Exception as exc:  # one failure must not crash the run
+                return name, {"points": {}, "summary": f"Analysis failed: {exc}"}
+
+    return dict(await asyncio.gather(*(run_one(name, tools) for name, tools in companies.items())))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

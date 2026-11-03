@@ -171,13 +171,118 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+I chose points **1, 2 and 5**. All three are database points, so each verdict
+can be computed exactly from the `sql_query` tool and compared against the
+company's own industry row in `industry_medians` — the median table has one
+column per point (`revenue_growth_2y_pct`, `new_product_share_pct`,
+`operating_margin_pct`). Fisher's wording for these three points is
+explicitly about *relative* performance ("sufficient", "still further",
+"worthwhile"), so an industry-median threshold is a faithful reading, and
+doing every sum and comparison in SQL/Python removes model arithmetic as a
+source of error.
+
+- **Point 1 — market potential for sales growth.** Fisher asks: "Does the
+  company have products or services with sufficient market potential to make
+  possible a sizable increase in sales for at least several years?"
+  **PASS rule:** revenue growth over the last two full fiscal years
+  (2023 → 2025, revenue = `SUM(orders.amount)`) is at least the industry
+  median 2-year growth. A company growing faster than the middle of its own
+  industry demonstrably has market potential; one falling behind does not.
+  Evidence: `orders`, `company`, `industry_medians`.
+
+- **Point 2 — new products as current lines mature.** Fisher asks whether
+  management has "a determination to continue to develop products or
+  processes that will still further increase total sales potentials when the
+  growth potentials of currently attractive product lines have largely been
+  exploited". **PASS rule:** products launched since 2023-01-01 account for
+  a share of all revenue since 2025-01-01 that is at least the industry
+  median new-product share (`new_product_share_pct`). If the newest product
+  lines already carry a median-or-better share of sales, the pipeline is
+  genuinely replacing maturing lines. Evidence: `products` (launch dates)
+  joined with `orders`, plus `industry_medians`.
+
+- **Point 5 — worthwhile profit margin.** Fisher asks: "Does the company
+  have a worthwhile profit margin?" **PASS rule:** the operating margin of
+  the last full fiscal year (2025),
+  `(revenue − cost of sales − selling and admin − R&D) ÷ revenue`, is at
+  least the industry median operating margin (`operating_margin_pct`).
+  "Worthwhile" is relative to what comparable businesses achieve, so the
+  industry median is the natural line. Evidence: `orders`,
+  `monthly_costs`, `industry_medians`.
+
+I deliberately did **not** pick interview points (one wasted or ambiguous
+interview costs a verdict) or document-checking points such as 10/14/15
+(comparing management's words against the database needs fuzzy judgement);
+the three database points above reproduce the public answer key exactly.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```
+                      ┌──────────────────────────────────────────┐
+                      │            analyze_companies             │
+                      │   asyncio.gather + semaphore (5 at a     │
+                      │   time), per-company try/except so one   │
+                      │   failure cannot crash the run           │
+                      └───────────────┬──────────────────────────┘
+                                      │ per company
+                                      ▼
+                      ┌──────────────────────────────────────────┐
+                      │  ROUTER: points 1, 2, 5 are all database │
+                      │  points → gather evidence with the       │
+                      │  sql_query tool only (0 interviews)      │
+                      └───────────────┬──────────────────────────┘
+                                      ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ EVIDENCE (tool calls, all arithmetic in SQL):           │
+        │  ① company × industry_medians  ② MIN/MAX order_date     │
+        │  ③ revenue by year  ④ new-product share (orders ⨝       │
+        │  products)  ⑤ cost sums from monthly_costs              │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ RULE ENGINE (pure Python, no model):                    │
+        │  p1: 2y growth ≥ median   p2: new share ≥ median        │
+        │  p5: FY margin ≥ median   → verdicts {1,2,5} PASS/FAIL  │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ PROMPT CHAIN (deepseek-v4-flash, temperature 0):        │
+        │  call 1: evidence → draft analyst summary               │
+        │  call 2: REFLECTION — check draft against evidence,     │
+        │          rewrite if a verdict or figure is misstated    │
+        │  fallback: if the API fails, the summary degrades to    │
+        │  the plain evidence text; verdicts are never affected   │
+        └─────────────────────────────────────────────────────────┘
+```
+
+The agent has a strict separation of concerns. The model is used only for
+what language models do well — turning evidence into fluent prose — and is
+never trusted with a number: every metric is computed by SQL aggregate
+queries through the provided tools, and every PASS/FAIL line is drawn by a
+fixed Python rule (`_apply_rules`). This follows Fisher twice over: the
+verdicts compare the company against its industry rather than accepting
+management's framing, and the reflection step is a cheap self-check of the
+written output against the evidence. Companies run concurrently (semaphore
+of 5; ~2 s per company of SQL plus two short model calls), so a 20-company
+run finishes in about a minute, far inside the 30-minute limit, and any
+single company error is caught and isolated.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+On `public_test` the agent scores **60/60 point verdicts, balanced point
+score 100.0%** (`Point accuracy: 60/60 (balanced: 100.0%)`), with
+`interviews_used = 0` for every company. There are no companies where my
+verdicts disagree with the public answers. Before choosing these rules I
+also tested nearby variants (1-year vs 2-year growth, different "new
+product" launch windows, TTM vs FY2025 margin): the chosen definitions, and
+several reasonable neighbours of them, all reproduce the public key 20/20,
+and every company sits several percentage points away from each threshold,
+so the verdicts are not sensitive to the exact window.
+
+### Task 2
+
+My reflection on AI-sycophancy and AI-psychosis is in
+[REFLECTION.md](REFLECTION.md).
